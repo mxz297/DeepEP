@@ -172,6 +172,19 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
+    def test_func_nvfp4_combine_v2(return_recv_hook: bool):
+        recv_x, recv_count, handle, event, hook = \
+            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                        cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                        use_fp8=False, use_nvfp4=True, x_global_scale=x_global_scale,
+                                        async_finish=False, return_recv_hook=return_recv_hook)
+        large_gemm_with_hook(hook) if return_recv_hook else None
+        combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                             use_logfmt=use_logfmt, return_recv_hook=return_recv_hook,
+                                                             overlap=True, src_signals=src_signals, src_signal_expect_value=src_signal_expect_value)
+        large_gemm_with_hook(hook) if return_recv_hook else None
+
+
     ########################################################
     # fp8
     ########################################################
@@ -222,6 +235,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=False), num_tests=1000)
     print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
+    
+    # Dispatch + combine testing
+    src_signal_expect_value = 144 - 32
+    src_signals = torch.tensor([src_signal_expect_value] * num_local_experts, dtype=torch.uint32, device="cuda")    
+    avg_t, min_t, max_t = bench(partial(test_func_nvfp4_combine_v2, return_recv_hook=False), num_tests=1000)
+    print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine_v2 bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+          f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
     # Separate profiling
     for return_recv_hook in (False, True):
@@ -237,7 +257,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         else:
             print(f'[rank {rank}] nvfp4 Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
                   f'bf16 Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us', flush=True)
-
+    """
     if args.no_kineto_profile:
         torch.cuda.profiler.start()
         if rank == 0:
@@ -270,6 +290,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         torch.cuda.profiler.stop()
         if rank == 0:
             print(f'Torch profiling done', flush=True)
+    """
     return hash_value
 
 
