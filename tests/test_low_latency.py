@@ -48,6 +48,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
+
     for current_x in x_list:
         for return_recv_hook in (False, True):
             for dispatch_data_type in ('bf16', 'fp8', 'nvfp4'):
@@ -141,6 +142,30 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 assert diff < diff_threshold, f'Error: {diff=}, {diff_threshold=}, {dispatch_use_fp8=}, {dispatch_use_nvfp4=}, {zero_copy=}'
                                 hash_value ^= hash_tensor(combined_x)
 
+                        if dispatch_use_nvfp4 and not use_logfmt and return_recv_hook:
+                            print("##### Enter overlap testing")
+                            zero_copy = False
+                            src_signal_expect_value = 144 - 32
+                            src_signals = torch.tensor([src_signal_expect_value] * num_local_experts, dtype=torch.uint32, device="cuda")    
+                            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                            combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                                use_logfmt=use_logfmt,
+                                                                                async_finish=not return_recv_hook, zero_copy=zero_copy,
+                                                                                return_recv_hook=return_recv_hook, out=out,
+                                                                                overlap=True, src_signals=src_signals, src_signal_expect_value=src_signal_expect_value)
+                            hook() if return_recv_hook else event.current_stream_wait()
+                            if do_check:
+                                diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
+                                assert torch.isnan(combined_x).sum().item() == 0
+                                if dispatch_use_fp8:
+                                    diff_threshold = 0.007
+                                elif dispatch_use_nvfp4:
+                                    diff_threshold = 0.007
+                                else:
+                                    diff_threshold = 1e-5
+                                assert diff < diff_threshold, f'Error: {diff=}, {diff_threshold=}, {dispatch_use_fp8=}, {dispatch_use_nvfp4=}, {zero_copy=}'
+                                hash_value ^= hash_tensor(combined_x)
+
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
         mat_0 = torch.randn((8192, 8192), dtype=torch.float)
@@ -167,10 +192,10 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=False, use_nvfp4=True, x_global_scale=x_global_scale,
                                         async_finish=False, return_recv_hook=return_recv_hook)
-        large_gemm_with_hook(hook) if return_recv_hook else None
+        hook() if return_recv_hook else None
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook)
-        large_gemm_with_hook(hook) if return_recv_hook else None
+        hook() if return_recv_hook else None
 
     def test_func_nvfp4_combine_v2(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
@@ -178,11 +203,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=False, use_nvfp4=True, x_global_scale=x_global_scale,
                                         async_finish=False, return_recv_hook=return_recv_hook)
-        large_gemm_with_hook(hook) if return_recv_hook else None
+        hook() if return_recv_hook else None
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook,
                                                              overlap=True, src_signals=src_signals, src_signal_expect_value=src_signal_expect_value)
-        large_gemm_with_hook(hook) if return_recv_hook else None
+        hook() if return_recv_hook else None
 
 
     ########################################################
@@ -232,14 +257,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=False), num_tests=1000)
+    avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=True), num_tests=1000)
     print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
     
     # Dispatch + combine testing
     src_signal_expect_value = 144 - 32
     src_signals = torch.tensor([src_signal_expect_value] * num_local_experts, dtype=torch.uint32, device="cuda")    
-    avg_t, min_t, max_t = bench(partial(test_func_nvfp4_combine_v2, return_recv_hook=False), num_tests=1000)
+    avg_t, min_t, max_t = bench(partial(test_func_nvfp4_combine_v2, return_recv_hook=True), num_tests=10)
     print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine_v2 bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 

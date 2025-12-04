@@ -516,12 +516,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
-            } else if constexpr (kUseNVFP4) {            
+            } else if constexpr (kUseNVFP4) {
                  // The physical layout is (l, rm, rk, 32, 4, 4)
                 const auto src_scales = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
-                
+
                 const auto rk = align<int>(kHidden / kNumPerChannels, 4) / 4;
                 const auto dim0_stride = rk * 128 * num_elems_per_pack;
                 const auto dim1_stride = 128 * num_elems_per_pack;
@@ -766,6 +766,214 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
             accum[k * 2 + 0] += static_cast<float>(bf16_pack.x) * weight;
             accum[k * 2 + 1] += static_cast<float>(bf16_pack.y) * weight;
         }
+    }
+}
+
+// TODO unify with original code
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+__global__
+__launch_bounds__(512, 1)
+// __maxnreg__(48) // rm
+void
+combine_v2_send_only(void* combined_x,
+        void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+        const void* x, const int64_t* topk_idx, const float* topk_weights,
+        const int* src_info, const int64_t* layout_range,
+        int64_t* combine_wait_recv_cost_stats,
+        int* next_clean, int num_next_clean_int,
+        int* atomic_clean_flag,
+        int num_combined_tokens, int hidden, int num_topk,
+        int num_max_dispatch_tokens_per_rank,
+        int num_experts, int rank, int num_ranks,
+        int num_warp_groups, int num_warps_per_group,
+        int phases, bool zero_copy,
+        uint32_t* src_signals, uint32_t src_signal_expect_value) {
+    const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
+    const auto dst_rank = sm_id / 7;
+    const auto hidden_tile_idx = sm_id % 7;
+    const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
+    const auto thread_id = static_cast<int>(threadIdx.x);
+    const auto num_threads = __shfl_sync(0xffffffff, static_cast<int>(blockDim.x), 0);
+    const auto warp_id = __shfl_sync(0xffffffff, thread_id / 32, 0), lane_id = get_lane_id();
+    const auto num_local_experts = num_experts / num_ranks;
+    const auto warp_group_id = warp_id / num_warps_per_group;
+    const auto sub_warp_id = warp_id % num_warps_per_group;
+
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
+    // Data type staffs
+    constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int hidden_bf16_int4 = kHidden / kNumElemsPerInt4;
+
+    // Use different unroll factors for send and recv phases
+    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
+    constexpr int kNumRecvUnrolls = 2;
+    constexpr int hidden_bf16_int4_pad = align(static_cast<int>(hidden_bf16_int4), 32 * kNumSendUnrolls);
+    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
+    EP_STATIC_ASSERT(hidden_bf16_int4 % kNumSendUnrolls == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
+
+    // Message package
+    EP_STATIC_ASSERT(kHidden % 128 == 0, "Invalid hidden");
+    constexpr int kNumDivisions = kHidden / 128;
+    constexpr int kNumMetaBytes = kNumDivisions * sizeof(nv_bfloat162);
+    constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes;
+    EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
+
+    // Clean up next buffer
+    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+        #pragma unroll
+        for (int i = lane_id; i < num_next_clean_int; i += 32)
+            next_clean[i] = 0;
+
+        // Notify before executing `int_p`
+        __syncwarp();
+        //if (lane_id == 0)
+        //    atomic_add_release_global(atomic_clean_flag, num_experts);
+    }
+
+    // Issue IBGDA sends
+    if (true) {
+        // NOTE move tma-related to outside local_expert_idx loop
+        // ------------------------------------------ START tma-related -------------------------------------------------
+        // TMA stuffs
+        constexpr int kNumTMABufferBytes = sizeof(int4) * 32 * kNumSendUnrolls;
+        constexpr int kNumStages = 3;
+        constexpr int kNumPrefetch = 1;
+        EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
+
+        auto smem_ptr = smem_buffer + warp_id * (kNumStages * (kNumTMABufferBytes + 16) + kNumMetaBytes);
+        uint32_t tma_phase = 0;
+        auto tma_buffers   = PatternVisitor([=](const int& i) { return reinterpret_cast<int4*>(smem_ptr + i * (kNumTMABufferBytes + 16)); });
+        auto full_barriers = PatternVisitor([=](const int& i) { return reinterpret_cast<uint64_t*>(smem_ptr + i * (kNumTMABufferBytes + 16) + kNumTMABufferBytes); });
+        auto meta_buffers  = kUseLogFMT ? reinterpret_cast<nv_bfloat162*>(smem_ptr + kNumStages * (kNumTMABufferBytes + 16)) : nullptr;
+        EP_STATIC_ASSERT(kNumSendUnrolls * kNumStages <= 12, "TMA buffer size exceed limit");
+
+        // Initialize m-barriers
+        if (lane_id == 0) {
+            mbarrier_init(full_barriers[lane_id], 1);
+            fence_view_async_shared();
+            fence_barrier_init();
+        }
+        __syncwarp();
+
+        constexpr int kNumIters = hidden_bf16_int4_pad / (32 * kNumSendUnrolls);
+        auto tma_load_and_arrive = [&](const int& stage_idx, const int4* gmem_ptr, const int& num_bytes) {
+            tma_load_1d(tma_buffers[stage_idx], gmem_ptr, full_barriers[stage_idx], num_bytes);
+            mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_bytes);
+        };
+        auto get_num_tma_bytes = [&](const int& offset_int4) {
+            return min(kNumTMABufferBytes, static_cast<int>((hidden_bf16_int4 - offset_int4) * sizeof(int4)));
+        };
+        // -------------------------------------------- END tma-related -----------------------------------------------
+
+
+
+        // NOTE
+        // before: "one warp group --- all tokens for one (dsk_rank, local_expert_idx)"
+        // after: "multiple warp groups --- cooperate on tokens for one (dsk_rank, local_expert_idx)"
+        // for (int local_expert_idx = 0; local_expert_idx < num_local_experts; ++local_expert_idx) {
+        for (int i = 0; i < num_local_experts; ++i) {
+            int local_expert_idx = i;
+            // NOTE changed
+            // const auto local_expert_idx = responsible_expert_idx % num_local_experts;
+            const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
+            const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
+            const auto local_x = static_cast<const int4*>(x) +
+                    local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4;
+            const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+            const auto rdma_send_x_vec = static_cast<uint8_t*>(rdma_send_x) +
+                    local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
+
+            // Unpack layout
+            int offset, num_tokens_to_send;
+            unpack2(layout, num_tokens_to_send, offset);
+
+            // NOTE added
+            if (src_signals != nullptr) {
+                // TODO shall we let 1st expert be separately computed and then do *not* wait for it
+                // if ((threadIdx.x == 0) and (local_expert_idx > 0)) {
+                if (threadIdx.x == 0) {
+                    wait_signal(src_signals + local_expert_idx, src_signal_expect_value);
+                }
+
+                // TODO original code uses NamedBarrier, better than this?
+                __syncthreads();
+            }
+
+            // Issue IBGDA send
+            // NOTE changed
+            for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
+                const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
+                const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
+                const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
+
+                // Copy directly to local rank, or copy to buffer and issue RDMA
+                //const auto src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0);
+                const auto src_idx = __ldg(local_src_info + token_idx);
+                const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
+                const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                EP_DEVICE_ASSERT(dst_p2p_ptr != 0);
+                int num_send_bytes = hidden * sizeof(nv_bfloat16);
+
+                // Read from `cpy_src_int4_ptr` and copy into `cpy_dst_int4_ptr`
+                const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<int4*>(buf_ptr) : x_int4;
+                const auto cpy_dst_int4_ptr = dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr) : reinterpret_cast<int4*>(dst_p2p_ptr);
+
+                const int offset_int4 = hidden_tile_idx * 32 * kNumSendUnrolls;
+                if (elect_one_sync(lane_id)) {
+                    tma_load_and_arrive(0, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                }
+                __syncwarp();
+                const int stage_idx = 0;
+                mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+
+                if (elect_one_sync(lane_id)) {
+                    tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                }
+                __syncwarp();
+
+                // Flush all stores
+                tma_store_wait();
+                __syncwarp();
+            }
+        }
+
+        // TODO maybe move to above?
+        // Put the finishing flag
+        EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
+        asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
+
+        if (sm_id == 0 and sub_warp_id < num_ranks and lane_id < num_local_experts) {
+            // copied from global to this part
+            const auto local_expert_idx_for_signal = lane_id;
+            const auto global_expert_idx_for_signal = rank * num_local_experts + local_expert_idx_for_signal;
+            const auto dst_rank = sub_warp_id;
+            // =============================================
+
+            //while (ld_acquire_global(atomic_clean_flag) == 0);
+            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx_for_signal);
+            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            if (dst_p2p_ptr == 0) {
+                // will not visit this branch
+                // nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                EP_DEVICE_ASSERT(0);
+            } else {
+                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
+            }
+            //atomic_add_release_global(atomic_clean_flag, -1);
+        }
+        __syncwarp();
+
+        // Destroy m-barriers
+        if (lane_id == 0) {
+            mbarrier_inval(full_barriers[lane_id]);
+            fence_view_async_shared();
+            fence_barrier_init();
+        }
+        __syncwarp();
     }
 }
 
@@ -1039,6 +1247,7 @@ combine_v2(void* combined_x,
         return;
 
     // Wait all ranks to arrive
+
     if (responsible_expert_idx < num_experts) {
         EP_DEVICE_ASSERT(num_warps_per_group > 1);
         if (sub_warp_id == 0 and lane_id == 0) {
@@ -1206,9 +1415,66 @@ void combine_v2(void* combined_x,
              uint32_t* src_signals, uint32_t src_signal_expect_value) {
     // NOTE reduce combine_send num sm
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+        //fprintf(stderr, "combine_v2 send only path\n");
         // TODO let it be configurable
-        num_device_sms = 32;
+        num_device_sms = 56;
+        constexpr int kNumMaxTopk = 9;
+        const int num_warp_groups = 1;
+        const int num_warps_per_group = 16;
+        const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
+        EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));
+
+        const auto num_warps = num_warp_groups * num_warps_per_group;
+        const auto num_sms = 56;
+
+        // Check workspace
+        auto atomic_clean_flag = static_cast<int*>(workspace);
+        EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+        EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+
+        // Online cast cannot use zero-copy
+        EP_HOST_ASSERT(not (zero_copy and use_logfmt));
+
+        constexpr int kNumStages = 3;
+        constexpr int kNumMaxUnrolls = 4;
+        constexpr int kMaxNumGroups = 2;
+
+        // Send buffer size
+        const int num_meta_bytes = hidden / 128 * 4;
+        const int num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16;
+        const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
+
+        // Receive buffer size
+        const int num_recv_tma_bytes = 16 + hidden * 2;
+        const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
+
+        // Total requirement
+        const int smem_size = max(smem_send_size, smem_recv_size);
+#define COMBINE_LAUNCH_CASE(hidden) { \
+auto combine_func = use_logfmt ? \
+    combine_v2_send_only<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : \
+    combine_v2_send_only<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+SET_SHARED_MEMORY_FOR_TMA(combine_func); \
+LAUNCH_KERNEL(&cfg, combine_func, \
+              combined_x, \
+              rdma_recv_x, rdma_recv_flag, rdma_send_x, \
+              x, topk_idx, topk_weights, src_info, layout_range, \
+              combine_wait_recv_cost_stats, \
+              next_clean, num_next_clean_int, \
+              atomic_clean_flag, \
+              num_combined_tokens, hidden, num_topk, \
+              num_max_dispatch_tokens_per_rank, \
+              num_experts, rank, num_ranks, \
+              num_warp_groups, num_warps_per_group, \
+              phases, zero_copy, \
+              src_signals, src_signal_expect_value); } break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
+#undef COMBINE_LAUNCH_CASE
+        return;
     }
+    //fprintf(stderr, "combine_v2 send+recv path, %d\n", phases);
 
     constexpr int kNumMaxTopk = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
