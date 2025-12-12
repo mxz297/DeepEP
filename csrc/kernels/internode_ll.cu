@@ -772,7 +772,7 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
 // TODO unify with original code
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
 __global__
-__launch_bounds__(512, 1)
+__launch_bounds__(1024, 1)
 // __maxnreg__(48) // rm
 void
 combine_v2_send_only(void* combined_x,
@@ -789,8 +789,6 @@ combine_v2_send_only(void* combined_x,
         int phases, bool zero_copy,
         uint32_t* src_signals, uint32_t src_signal_expect_value) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
-    const auto dst_rank = sm_id / 7;
-    const auto hidden_tile_idx = sm_id % 7;
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto num_threads = __shfl_sync(0xffffffff, static_cast<int>(blockDim.x), 0);
@@ -798,6 +796,9 @@ combine_v2_send_only(void* combined_x,
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
+    const auto dst_rank = (sm_id * num_warp_groups + warp_group_id) / 8;
+    const auto hidden_tile_idx = (sm_id * num_warp_groups + warp_group_id) % 8;
+
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -922,22 +923,24 @@ combine_v2_send_only(void* combined_x,
                 const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<int4*>(buf_ptr) : x_int4;
                 const auto cpy_dst_int4_ptr = dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr) : reinterpret_cast<int4*>(dst_p2p_ptr);
 
-                const int offset_int4 = hidden_tile_idx * 32 * kNumSendUnrolls;
-                if (elect_one_sync(lane_id)) {
-                    tma_load_and_arrive(0, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
-                }
-                __syncwarp();
-                const int stage_idx = 0;
-                mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+                if (hidden_tile_idx < 7) {
+                    const int offset_int4 = hidden_tile_idx * 32 * kNumSendUnrolls;
+                    if (elect_one_sync(lane_id)) {
+                        tma_load_and_arrive(0, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                    }
+                    __syncwarp();
+                    const int stage_idx = 0;
+                    mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
 
-                if (elect_one_sync(lane_id)) {
-                    tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
-                }
-                __syncwarp();
+                    if (elect_one_sync(lane_id)) {
+                        tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                    }
+                    __syncwarp();
 
-                // Flush all stores
-                tma_store_wait();
-                __syncwarp();
+                    // Flush all stores
+                    tma_store_wait();
+                    __syncwarp();
+                }
             }
         }
 
@@ -1417,15 +1420,15 @@ void combine_v2(void* combined_x,
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
         //fprintf(stderr, "combine_v2 send only path\n");
         // TODO let it be configurable
-        num_device_sms = 56;
+        num_device_sms = 32;
         constexpr int kNumMaxTopk = 9;
-        const int num_warp_groups = 1;
+        const int num_warp_groups = 2;
         const int num_warps_per_group = 16;
         const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
         EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));
 
         const auto num_warps = num_warp_groups * num_warps_per_group;
-        const auto num_sms = 56;
+        const auto num_sms = 32;
 
         // Check workspace
         auto atomic_clean_flag = static_cast<int*>(workspace);
