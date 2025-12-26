@@ -796,8 +796,11 @@ combine_v2_send_only(void* combined_x,
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
-    const auto dst_rank = (sm_id * num_warp_groups + warp_group_id) / 8;
-    const auto hidden_tile_idx = (sm_id * num_warp_groups + warp_group_id) % 8;
+    const auto dst_rank = sm_id % num_ranks;
+    const auto sm_id_for_dst_rank = sm_id / num_ranks;
+    const auto warp_groups_for_token_dim = (num_sms / num_ranks) * num_warp_groups;
+    const auto token_dim_warp_group_idx = (sm_id_for_dst_rank * num_warp_groups + warp_group_id) % warp_groups_for_token_dim;
+    const auto hidden_tile_idx = sub_warp_id;
 
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -905,7 +908,7 @@ combine_v2_send_only(void* combined_x,
 
             // Issue IBGDA send
             // NOTE changed
-            for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
+            for (int token_idx = offset + token_dim_warp_group_idx; token_idx < offset + num_tokens_to_send; token_idx += warp_groups_for_token_dim) {
                 const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
                 const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
                 const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
@@ -923,24 +926,22 @@ combine_v2_send_only(void* combined_x,
                 const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<int4*>(buf_ptr) : x_int4;
                 const auto cpy_dst_int4_ptr = dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr) : reinterpret_cast<int4*>(dst_p2p_ptr);
 
-                if (hidden_tile_idx < 7) {
-                    const int offset_int4 = hidden_tile_idx * 32 * kNumSendUnrolls;
-                    if (elect_one_sync(lane_id)) {
-                        tma_load_and_arrive(0, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
-                    }
-                    __syncwarp();
-                    const int stage_idx = 0;
-                    mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
-
-                    if (elect_one_sync(lane_id)) {
-                        tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
-                    }
-                    __syncwarp();
-
-                    // Flush all stores
-                    tma_store_wait();
-                    __syncwarp();
+                const int offset_int4 = hidden_tile_idx * 32 * kNumSendUnrolls;
+                if (elect_one_sync(lane_id)) {
+                    tma_load_and_arrive(0, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
                 }
+                __syncwarp();
+                const int stage_idx = 0;
+                mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+
+                if (elect_one_sync(lane_id)) {
+                    tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                }
+                __syncwarp();
+
+                // Flush all stores
+                tma_store_wait();
+                __syncwarp();
             }
         }
 
@@ -949,11 +950,10 @@ combine_v2_send_only(void* combined_x,
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
 
-        if (sm_id == 0 and sub_warp_id < num_ranks and lane_id < num_local_experts) {
+        if (sm_id_for_dst_rank == 0 and lane_id < num_local_experts) {
             // copied from global to this part
             const auto local_expert_idx_for_signal = lane_id;
             const auto global_expert_idx_for_signal = rank * num_local_experts + local_expert_idx_for_signal;
-            const auto dst_rank = sub_warp_id;
             // =============================================
 
             //while (ld_acquire_global(atomic_clean_flag) == 0);
@@ -1420,15 +1420,15 @@ void combine_v2(void* combined_x,
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
         //fprintf(stderr, "combine_v2 send only path\n");
         // TODO let it be configurable
-        num_device_sms = 32;
+        num_device_sms = 64;
         constexpr int kNumMaxTopk = 9;
         const int num_warp_groups = 2;
-        const int num_warps_per_group = 16;
+        const int num_warps_per_group = 7;
         const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
         EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));
 
         const auto num_warps = num_warp_groups * num_warps_per_group;
-        const auto num_sms = 32;
+        const auto num_sms = num_device_sms;
 
         // Check workspace
         auto atomic_clean_flag = static_cast<int*>(workspace);
@@ -1437,6 +1437,8 @@ void combine_v2(void* combined_x,
 
         // Online cast cannot use zero-copy
         EP_HOST_ASSERT(not (zero_copy and use_logfmt));
+
+        EP_HOST_ASSERT(num_sms % num_ranks == 0);
 
         constexpr int kNumStages = 3;
         constexpr int kNumMaxUnrolls = 4;
