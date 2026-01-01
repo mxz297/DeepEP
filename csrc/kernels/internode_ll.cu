@@ -1420,9 +1420,9 @@ void combine_v2(void* combined_x,
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
         //fprintf(stderr, "combine_v2 send only path\n");
         // TODO let it be configurable
-        num_device_sms = 64;
+        num_device_sms = 32;
         constexpr int kNumMaxTopk = 9;
-        const int num_warp_groups = 2;
+        const int num_warp_groups = 4;
         const int num_warps_per_group = 7;
         const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
         EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0 and ((num_combined_tokens == 0) or (num_recv_per_sm > 0)));

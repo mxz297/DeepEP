@@ -218,11 +218,15 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
 def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')    
 
     # Warmup
     for _ in range(num_warmups):
         fn()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()        
 
     # Flush L2
     cache.zero_()
@@ -233,7 +237,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     for i in range(num_tests):
         # Record
         start_events[i].record()
-        fn()
+        g.replay()        
         end_events[i].record()
         if post_fn is not None:
             post_fn()
@@ -289,6 +293,10 @@ class suppress_stdout_stderr:
 def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None, barrier_comm_profiling: bool = False,
                  num_kernels_per_period: int = 1):
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()     
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
@@ -302,9 +310,14 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
                 for _ in range(num_tests):
-                    fn()
+                    g.replay()
                 torch.cuda.synchronize()
                 prof.step()
+
+    # Save chrome traces
+    if trace_path is not None:
+        prof.export_chrome_trace(trace_path)
+        return None
 
     # Parse the profiling table
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
@@ -314,10 +327,6 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
         assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
-
-    # Save chrome traces
-    if trace_path is not None:
-        prof.export_chrome_trace(trace_path)
 
     # Return average kernel durations
     units = {'ms': 1e3, 'us': 1e6}
